@@ -1,27 +1,28 @@
-import re
 import os
+import re
 import httpx
 from fastapi import FastAPI, HTTPException
 
-app = FastAPI(title="Лид-бот v3")
+app = FastAPI(title="Лид-бот 2GIS v1")
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/javascript, */*",
-    "Accept-Language": "ru-RU,ru;q=0.9",
-    "Referer": "https://yandex.ru/maps/",
-}
+TWOGIS_KEY = os.getenv("TWOGIS_API_KEY", "")
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-
-
-async def search_yandex(query: str, location: str, max_results: int = 10):
+async def search_2gis(query: str, location: str, max_results: int = 5):
+    """Ищем бизнесы через официальный 2GIS Places API."""
     results = []
-    text = f"{query} {location}"
-    url = "https://yandex.ru/maps/api/search"
-    params = {"text": text, "type": "biz", "lang": "ru_RU", "results": min(max_results * 2, 50), "origin": "maps-web.serp", "ajax": 1}
+
+    url = "https://catalog.api.2gis.com/3.0/items"
+    params = {
+        "q": f"{query} {location}",
+        "key": TWOGIS_KEY,
+        "type": "branch",
+        "locale": "ru_RU",
+        "page_size": min(max_results, 20),
+        "fields": "items.contact_groups,items.schedule,items.description,items.external_content,items.rubrics,items.reviews",
+    }
+
     try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=30, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(url, params=params)
             if resp.status_code != 200:
                 return []
@@ -29,224 +30,179 @@ async def search_yandex(query: str, location: str, max_results: int = 10):
     except Exception:
         return []
 
-    features = []
-    if isinstance(data, dict):
-        features = data.get("data", {}).get("features", []) or data.get("features", []) or []
+    items = data.get("result", {}).get("items", [])
 
-    for feature in features[:max_results]:
+    for item in items[:max_results]:
         try:
-            props = feature.get("properties", {})
-            meta = props.get("CompanyMetaData", {})
-            name = meta.get("name", "") or props.get("name", "")
+            name = item.get("name", "")
             if not name:
                 continue
-            org_id = meta.get("id", "")
-            address = meta.get("address", "") or props.get("description", "")
-            website = meta.get("url", "")
-            phones = [p.get("formatted", "") for p in meta.get("Phones", []) if p.get("formatted")]
-            categories = [c.get("name", "") for c in meta.get("Categories", []) if c.get("name")]
-            rating_obj = meta.get("rating", {})
-            rating = rating_obj.get("ratings", 0) or 0
-            reviews = rating_obj.get("reviews", 0) or 0
-            city = location
-            if address:
-                parts = [p.strip() for p in address.split(",")]
-                if len(parts) >= 2:
-                    city = parts[-2]
-            results.append({
-                "title": name,
-                "url": f"https://yandex.ru/maps/org/{org_id}/" if org_id else "",
-                "website": website,
-                "phones": phones,
-                "address": address,
-                "city": city,
-                "categories": categories,
-                "rating": rating,
-                "ratingsCount": reviews,
-                "hasWebsite": bool(website and "yandex" not in website),
-            })
-        except Exception:
-            continue
-    return results
 
+            # Адрес
+            address_name = item.get("address_name", "")
+            full_address = item.get("full_name", address_name)
 
-async def search_via_suggest(query: str, location: str, max_results: int = 10):
-    results = []
-    text = f"{query} {location}"
-    url = "https://suggest-maps.yandex.ru/suggest-geo"
-    params = {"text": text, "lang": "ru_RU", "n": max_results, "v": 9, "type": "biz"}
-    try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=20) as client:
-            resp = await client.get(url, params=params)
-            data = resp.json()
-    except Exception:
-        return []
-    for item in data.get("results", [])[:max_results]:
-        try:
-            name = item.get("title", {}).get("text", "")
-            if not name:
-                continue
-            subtitle = item.get("subtitle", {}).get("text", "")
-            uri = item.get("uri", "")
-            org_id = ""
-            if "org/" in uri:
-                parts = uri.split("org/")
-                if len(parts) > 1:
-                    org_id = parts[1].rstrip("/").split("/")[0]
+            # Телефоны и сайт из contact_groups
+            phones = []
+            website = ""
+            social = []
+            for group in item.get("contact_groups", []):
+                for contact in group.get("contacts", []):
+                    ctype = contact.get("type", "")
+                    value = contact.get("value", "")
+                    if ctype == "phone":
+                        phones.append(value)
+                    elif ctype == "website":
+                        website = value
+                    elif ctype in ("vkontakte", "instagram", "facebook", "telegram", "whatsapp"):
+                        social.append(f"{ctype}: {value}")
+
+            # Рубрики/категории
+            rubrics = [r.get("name", "") for r in item.get("rubrics", []) if r.get("name")]
+
+            # Описание
+            description = item.get("description", "")
+
+            # Рейтинг и отзывы
+            reviews_obj = item.get("reviews", {})
+            rating = reviews_obj.get("general_rating", 0)
+            reviews_count = reviews_obj.get("general_review_count", 0)
+
+            # Режим работы
+            schedule = item.get("schedule", {})
+            schedule_text = ""
+            days_map = {"Mon": "Пн", "Tue": "Вт", "Wed": "Ср", "Thu": "Чт", "Fri": "Пт", "Sat": "Сб", "Sun": "Вс"}
+            schedule_lines = []
+            for day_en, day_ru in days_map.items():
+                day_data = schedule.get(day_en, {})
+                if day_data.get("working"):
+                    working_hours = day_data.get("working_hours", [])
+                    if working_hours:
+                        wh = working_hours[0]
+                        schedule_lines.append(f"{day_ru}: {wh.get('from','')}-{wh.get('to','')}")
+                else:
+                    schedule_lines.append(f"{day_ru}: выходной")
+            schedule_text = ", ".join(schedule_lines)
+
+            # Фото
+            photos = []
+            for ext in item.get("external_content", []):
+                if ext.get("type") == "photo":
+                    for photo in ext.get("photos", [])[:3]:
+                        preview = photo.get("preview_url", "")
+                        if preview:
+                            photos.append(preview)
+
+            # Ссылка на 2GIS
+            obj_id = item.get("id", "")
+            maps_url = f"https://2gis.ru/firm/{obj_id}" if obj_id else ""
+
             results.append({
-                "title": name,
-                "url": f"https://yandex.ru/maps/org/{org_id}/" if org_id else uri,
-                "website": "",
-                "phones": [],
-                "address": subtitle,
+                "name": name,
+                "address": full_address,
                 "city": location,
-                "categories": [],
-                "rating": 0,
-                "ratingsCount": 0,
-                "hasWebsite": False,
+                "phones": phones,
+                "website": website,
+                "social": social,
+                "categories": rubrics,
+                "description": description,
+                "rating": rating,
+                "reviews_count": reviews_count,
+                "schedule": schedule_text,
+                "photos": photos,
+                "maps_url": maps_url,
+                "has_website": bool(website),
             })
         except Exception:
             continue
+
     return results
 
 
-async def score_with_claude(biz: dict, api_key: str) -> dict:
-    """Вызываем Claude и возвращаем готовый скоринг."""
-    prompt = f"""Ты — AI-аналитик лидов для продажи сайтов и AI-автоматизаций малому бизнесу.
+def format_lead_card(biz: dict) -> str:
+    """Форматируем карточку лида для Telegram — чтобы копировать и вставлять мне."""
+    lines = []
+    lines.append("📋 ДАННЫЕ ДЛЯ СБОРКИ САЙТА")
+    lines.append("─" * 30)
+    lines.append(f"🏢 Название: {biz['name']}")
+    lines.append(f"📂 Категория: {', '.join(biz['categories']) or '—'}")
+    lines.append(f"📍 Адрес: {biz['address']}")
+    lines.append(f"📞 Телефон: {', '.join(biz['phones']) or '—'}")
+    lines.append(f"🌐 Сайт: {biz['website'] or 'нет'}")
 
-Данные бизнеса из Яндекс Карт:
-Название: {biz.get('title', '')}
-Категория: {', '.join(biz.get('categories', []))}
-Город: {biz.get('city', '')}
-Адрес: {biz.get('address', '')}
-Телефон: {', '.join(biz.get('phones', []))}
-Сайт: {biz.get('website', '')}
-Рейтинг: {biz.get('rating', 0)}
-Количество отзывов: {biz.get('ratingsCount', 0)}
-Ссылка на карточку: {biz.get('url', '')}
+    if biz['social']:
+        lines.append(f"📱 Соцсети: {', '.join(biz['social'])}")
 
-Проанализируй бизнес:
-1. Есть ли полноценный сайт (ссылка на Яндекс Карты НЕ считается сайтом)
-2. Оцени перспективность для предложения сайта или AI-автоматизации
-3. Поставь оценку лида от 1 до 10
-4. Определи статус: горячий / средний / слабый
-5. Напиши короткий вердикт
-6. Предложи что именно продать
-7. Напиши первое сообщение клиенту — коротко, вежливо, персонально
+    if biz['rating']:
+        lines.append(f"⭐ Рейтинг: {biz['rating']} ({biz['reviews_count']} отзывов)")
 
-Верни ТОЛЬКО JSON объект без какого-либо текста вокруг него:
-{{"est_sait": "", "ocenka_lida": "", "status_lida": "", "verdikt": "", "chto_predlozhit": "", "soobshchenie_klientu": ""}}"""
+    if biz['schedule']:
+        lines.append(f"🕐 Режим работы: {biz['schedule']}")
 
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "Content-Type": "application/json",
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                },
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 700,
-                    "messages": [{"role": "user", "content": prompt}]
-                }
-            )
-            if resp.status_code != 200:
-                return {}
-            data = resp.json()
-            text = data.get("content", [{}])[0].get("text", "")
-            # Очищаем от markdown если есть
-            text = re.sub(r'```json\s*', '', text)
-            text = re.sub(r'```\s*', '', text)
-            text = text.strip()
-            # Ищем JSON объект
-            match = re.search(r'\{[\s\S]*\}', text)
-            if match:
-                import json
-                return json.loads(match.group())
-    except Exception:
-        pass
-    return {}
+    if biz['description']:
+        lines.append(f"📝 Описание: {biz['description'][:300]}")
+
+    lines.append(f"🔗 2GIS: {biz['maps_url']}")
+
+    if biz['photos']:
+        lines.append("─" * 30)
+        lines.append("📸 Фото:")
+        for i, url in enumerate(biz['photos'][:3], 1):
+            lines.append(f"  {i}. {url}")
+
+    lines.append("─" * 30)
+    has = "✅ есть" if biz['has_website'] else "❌ нет"
+    lines.append(f"💻 Сайт: {has}")
+
+    return "\n".join(lines)
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Лид-бот v3 работает"}
+    return {"status": "ok", "message": "Лид-бот 2GIS работает"}
 
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
 
-@app.post("/find_leads")
-async def find_leads(body: dict):
+@app.post("/leads")
+async def get_leads(body: dict):
     """
-    Главный эндпоинт — ищет бизнесы И скорит их через Claude.
-    Make.com вызывает только этот один модуль.
+    Ищет бизнесы через 2GIS и возвращает карточки лидов.
 
-    Запрос: {"query": "кафе", "location": "Серов", "maxResults": 5, "claude_key": "sk-ant-..."}
-    Ответ: список лидов с готовым скорингом
+    Запрос: {"query": "автосервис", "location": "Серов", "maxResults": 5}
     """
     query = body.get("query", "").strip()
     location = body.get("location", "").strip()
     max_res = int(body.get("maxResults", 5))
-    api_key = body.get("claude_key", "") or ANTHROPIC_API_KEY
 
     if not query or not location:
         raise HTTPException(status_code=400, detail="query и location обязательны")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="claude_key обязателен")
 
-    # Ищем бизнесы
-    items = await search_yandex(query, location, max_res)
-    if not items:
-        items = await search_via_suggest(query, location, max_res)
+    if not TWOGIS_KEY:
+        raise HTTPException(status_code=500, detail="TWOGIS_API_KEY не задан")
+
+    items = await search_2gis(query, location, max_res)
 
     if not items:
-        return {"query": query, "location": location, "count": 0, "leads": []}
+        return {
+            "query": query,
+            "location": location,
+            "count": 0,
+            "cards": [],
+            "message": "Ничего не найдено"
+        }
 
-    # Берём первый бизнес и скорим через Claude
-    biz = items[0]
-    scoring = await score_with_claude(biz, api_key)
-
-    # Собираем итоговый результат
-    lead = {
-        "title": biz.get("title", ""),
-        "url": biz.get("url", ""),
-        "website": biz.get("website", ""),
-        "phones": ", ".join(biz.get("phones", [])),
-        "address": biz.get("address", ""),
-        "city": biz.get("city", ""),
-        "categories": ", ".join(biz.get("categories", [])),
-        "rating": biz.get("rating", 0),
-        "ratingsCount": biz.get("ratingsCount", 0),
-        # Скоринг от Claude
-        "est_sait": scoring.get("est_sait", ""),
-        "ocenka_lida": scoring.get("ocenka_lida", ""),
-        "status_lida": scoring.get("status_lida", ""),
-        "verdikt": scoring.get("verdikt", ""),
-        "chto_predlozhit": scoring.get("chto_predlozhit", ""),
-        "soobshchenie_klientu": scoring.get("soobshchenie_klientu", ""),
-    }
+    cards = []
+    for biz in items:
+        cards.append({
+            "card_text": format_lead_card(biz),
+            "data": biz,
+        })
 
     return {
         "query": query,
         "location": location,
-        "count": len(items),
-        "lead": lead,
-        "all_items": items,
+        "count": len(cards),
+        "cards": cards,
     }
-
-
-@app.post("/search")
-async def search(body: dict):
-    """Простой поиск без скоринга — для совместимости."""
-    query = body.get("query", "").strip()
-    location = body.get("location", "").strip()
-    max_res = int(body.get("maxResults", 10))
-    if not query or not location:
-        raise HTTPException(status_code=400, detail="query и location обязательны")
-    items = await search_yandex(query, location, max_res)
-    if not items:
-        items = await search_via_suggest(query, location, max_res)
-    return {"query": query, "location": location, "count": len(items), "items": items}
