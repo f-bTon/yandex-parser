@@ -1,16 +1,12 @@
 import os
-import re
 import httpx
 from fastapi import FastAPI, HTTPException
 
-app = FastAPI(title="Лид-бот 2GIS v1")
+app = FastAPI(title="Лид-бот 2GIS v2")
 
 TWOGIS_KEY = os.getenv("TWOGIS_API_KEY", "")
 
 async def search_2gis(query: str, location: str, max_results: int = 5):
-    """Ищем бизнесы через официальный 2GIS Places API."""
-    results = []
-
     url = "https://catalog.api.2gis.com/3.0/items"
     params = {
         "q": f"{query} {location}",
@@ -20,7 +16,6 @@ async def search_2gis(query: str, location: str, max_results: int = 5):
         "page_size": min(max_results, 20),
         "fields": "items.contact_groups,items.schedule,items.description,items.external_content,items.rubrics,items.reviews",
     }
-
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(url, params=params)
@@ -31,6 +26,7 @@ async def search_2gis(query: str, location: str, max_results: int = 5):
         return []
 
     items = data.get("result", {}).get("items", [])
+    results = []
 
     for item in items[:max_results]:
         try:
@@ -38,80 +34,61 @@ async def search_2gis(query: str, location: str, max_results: int = 5):
             if not name:
                 continue
 
-            # Адрес
-            address_name = item.get("address_name", "")
-            full_address = item.get("full_name", address_name)
+            address = item.get("address_name", "") or item.get("full_name", "")
+            phones, website, social = [], "", []
 
-            # Телефоны и сайт из contact_groups
-            phones = []
-            website = ""
-            social = []
             for group in item.get("contact_groups", []):
                 for contact in group.get("contacts", []):
-                    ctype = contact.get("type", "")
-                    value = contact.get("value", "")
-                    if ctype == "phone":
-                        phones.append(value)
-                    elif ctype == "website":
-                        website = value
-                    elif ctype in ("vkontakte", "instagram", "facebook", "telegram", "whatsapp"):
-                        social.append(f"{ctype}: {value}")
+                    ct = contact.get("type", "")
+                    val = contact.get("value", "")
+                    if ct == "phone":
+                        phones.append(val)
+                    elif ct == "website":
+                        website = val
+                    elif ct in ("vkontakte", "instagram", "facebook", "telegram", "whatsapp"):
+                        social.append(f"{ct}: {val}")
 
-            # Рубрики/категории
             rubrics = [r.get("name", "") for r in item.get("rubrics", []) if r.get("name")]
-
-            # Описание
             description = item.get("description", "")
-
-            # Рейтинг и отзывы
             reviews_obj = item.get("reviews", {})
             rating = reviews_obj.get("general_rating", 0)
             reviews_count = reviews_obj.get("general_review_count", 0)
 
-            # Режим работы
+            days_map = {"Mon":"Пн","Tue":"Вт","Wed":"Ср","Thu":"Чт","Fri":"Пт","Sat":"Сб","Sun":"Вс"}
             schedule = item.get("schedule", {})
-            schedule_text = ""
-            days_map = {"Mon": "Пн", "Tue": "Вт", "Wed": "Ср", "Thu": "Чт", "Fri": "Пт", "Sat": "Сб", "Sun": "Вс"}
-            schedule_lines = []
+            sched_parts = []
             for day_en, day_ru in days_map.items():
                 day_data = schedule.get(day_en, {})
                 if day_data.get("working"):
-                    working_hours = day_data.get("working_hours", [])
-                    if working_hours:
-                        wh = working_hours[0]
-                        schedule_lines.append(f"{day_ru}: {wh.get('from','')}-{wh.get('to','')}")
-                else:
-                    schedule_lines.append(f"{day_ru}: выходной")
-            schedule_text = ", ".join(schedule_lines)
+                    wh = day_data.get("working_hours", [{}])[0]
+                    sched_parts.append(f"{day_ru}: {wh.get('from','')}-{wh.get('to','')}")
+            schedule_text = ", ".join(sched_parts)
 
-            # Фото
             photos = []
             for ext in item.get("external_content", []):
                 if ext.get("type") == "photo":
-                    for photo in ext.get("photos", [])[:3]:
-                        preview = photo.get("preview_url", "")
-                        if preview:
-                            photos.append(preview)
+                    for p in ext.get("photos", [])[:3]:
+                        if p.get("preview_url"):
+                            photos.append(p["preview_url"])
 
-            # Ссылка на 2GIS
             obj_id = item.get("id", "")
             maps_url = f"https://2gis.ru/firm/{obj_id}" if obj_id else ""
 
             results.append({
                 "name": name,
-                "address": full_address,
+                "address": address,
                 "city": location,
-                "phones": phones,
+                "phones": ", ".join(phones),
                 "website": website,
-                "social": social,
-                "categories": rubrics,
-                "description": description,
-                "rating": rating,
-                "reviews_count": reviews_count,
+                "social": ", ".join(social),
+                "categories": ", ".join(rubrics),
+                "description": description[:300] if description else "",
+                "rating": str(rating),
+                "reviews_count": str(reviews_count),
                 "schedule": schedule_text,
-                "photos": photos,
+                "photos": "\n".join(photos),
                 "maps_url": maps_url,
-                "has_website": bool(website),
+                "has_website": "✅ есть" if website else "❌ нет",
             })
         except Exception:
             continue
@@ -119,47 +96,38 @@ async def search_2gis(query: str, location: str, max_results: int = 5):
     return results
 
 
-def format_lead_card(biz: dict) -> str:
-    """Форматируем карточку лида для Telegram — чтобы копировать и вставлять мне."""
-    lines = []
-    lines.append("📋 ДАННЫЕ ДЛЯ СБОРКИ САЙТА")
-    lines.append("─" * 30)
-    lines.append(f"🏢 Название: {biz['name']}")
-    lines.append(f"📂 Категория: {', '.join(biz['categories']) or '—'}")
-    lines.append(f"📍 Адрес: {biz['address']}")
-    lines.append(f"📞 Телефон: {', '.join(biz['phones']) or '—'}")
-    lines.append(f"🌐 Сайт: {biz['website'] or 'нет'}")
-
+def format_card(biz: dict) -> str:
+    lines = [
+        "📋 ДАННЫЕ ДЛЯ СБОРКИ САЙТА",
+        "─────────────────────────",
+        f"🏢 {biz['name']}",
+        f"📂 {biz['categories'] or '—'}",
+        f"📍 {biz['address']}",
+        f"📞 {biz['phones'] or '—'}",
+        f"🌐 Сайт: {biz['website'] or 'нет'}",
+    ]
     if biz['social']:
-        lines.append(f"📱 Соцсети: {', '.join(biz['social'])}")
-
-    if biz['rating']:
-        lines.append(f"⭐ Рейтинг: {biz['rating']} ({biz['reviews_count']} отзывов)")
-
+        lines.append(f"📱 {biz['social']}")
+    if biz['rating'] and biz['rating'] != '0':
+        lines.append(f"⭐ {biz['rating']} ({biz['reviews_count']} отзывов)")
     if biz['schedule']:
-        lines.append(f"🕐 Режим работы: {biz['schedule']}")
-
+        lines.append(f"🕐 {biz['schedule']}")
     if biz['description']:
-        lines.append(f"📝 Описание: {biz['description'][:300]}")
-
-    lines.append(f"🔗 2GIS: {biz['maps_url']}")
-
+        lines.append(f"📝 {biz['description']}")
+    lines.append(f"🔗 {biz['maps_url']}")
     if biz['photos']:
-        lines.append("─" * 30)
+        lines.append("─────────────────────────")
         lines.append("📸 Фото:")
-        for i, url in enumerate(biz['photos'][:3], 1):
-            lines.append(f"  {i}. {url}")
-
-    lines.append("─" * 30)
-    has = "✅ есть" if biz['has_website'] else "❌ нет"
-    lines.append(f"💻 Сайт: {has}")
-
+        for url in biz['photos'].split("\n")[:3]:
+            lines.append(f"  {url}")
+    lines.append("─────────────────────────")
+    lines.append(f"💻 Сайт: {biz['has_website']}")
     return "\n".join(lines)
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Лид-бот 2GIS работает"}
+    return {"status": "ok", "message": "Лид-бот 2GIS v2 работает"}
 
 @app.get("/health")
 async def health():
@@ -167,18 +135,12 @@ async def health():
 
 @app.post("/leads")
 async def get_leads(body: dict):
-    """
-    Ищет бизнесы через 2GIS и возвращает карточки лидов.
-
-    Запрос: {"query": "автосервис", "location": "Серов", "maxResults": 5}
-    """
     query = body.get("query", "").strip()
     location = body.get("location", "").strip()
     max_res = int(body.get("maxResults", 5))
 
     if not query or not location:
         raise HTTPException(status_code=400, detail="query и location обязательны")
-
     if not TWOGIS_KEY:
         raise HTTPException(status_code=500, detail="TWOGIS_API_KEY не задан")
 
@@ -186,23 +148,26 @@ async def get_leads(body: dict):
 
     if not items:
         return {
-            "query": query,
-            "location": location,
+            "found": False,
             "count": 0,
-            "cards": [],
-            "message": "Ничего не найдено"
+            "card_text": "❌ Ничего не найдено по запросу",
+            "name": "", "address": "", "city": location,
+            "phones": "", "website": "", "social": "",
+            "categories": "", "description": "", "rating": "",
+            "reviews_count": "", "schedule": "", "photos": "",
+            "maps_url": "", "has_website": "❌ нет",
+            "all_names": ""
         }
 
-    cards = []
-    for biz in items:
-        cards.append({
-            "card_text": format_lead_card(biz),
-            "data": biz,
-        })
+    # Первый лид — основной
+    main = items[0]
+    # Все найденные названия — для информации
+    all_names = "\n".join([f"{i+1}. {b['name']}" for i, b in enumerate(items)])
 
     return {
-        "query": query,
-        "location": location,
-        "count": len(cards),
-        "cards": cards,
+        "found": True,
+        "count": len(items),
+        "card_text": format_card(main),
+        "all_names": all_names,
+        **main
     }
